@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Morais Piscinas - Login Admin com Biometria</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; background:#eef7ff; padding:20px }
+    .card { max-width:720px; margin:auto; background:#fff; padding:20px; border-radius:8px }
+    input, button { width:100%; padding:10px; margin-top:8px; border-radius:6px; border:1px solid #ccc }
+    button { background:#0077cc; color:#fff; cursor:pointer; border:none }
+    button.secondary { background:#eee; color:#222 }
+    .row { display:flex; gap:10px }
+    .row > * { flex:1 }
+    pre { background:#f4f4f4; padding:10px; overflow:auto }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h2>Login Administrador — Morais Piscinas</h2>
+
+  <h3>Login por senha (fallback)</h3>
+  <input id="usuario" placeholder="Usuário (ex: admin)" value="admin">
+  <input id="senha" type="password" placeholder="Senha">
+  <button id="btnLoginSenha">Entrar com senha</button>
+
+  <hr>
+
+  <h3>Biometria facial / autenticador do dispositivo</h3>
+  <p>1) Registre a biometria para um usuário administrador</p>
+  <div class="row">
+    <button id="btnRegistrarBiometria">Registrar biometria</button>
+    <button id="btnLoginBiometria" class="secondary">Login com biometria</button>
+  </div>
+
+  <p id="status" style="margin-top:12px;color:#333"></p>
+
+  <hr>
+
+  <h3>Debug / Credenciais armazenadas</h3>
+  <pre id="dump">Aguardando ação</pre>
+</div>
+
+
+<!-- script type module para usar imports do Firebase -->
+<script type="module">
+
+// -------------------- FIREBASE --------------------
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js"
+import { getDatabase, ref, set, get, child, update } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js"
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAlgtGJTYExN8KlvKkxUJ_7YeVAuoE5waA",
+  authDomain: "moraissite.firebaseapp.com",
+  databaseURL: "https://moraissite-default-rtdb.firebaseio.com",
+  projectId: "moraissite",
+  storageBucket: "moraissite.firebasestorage.app",
+  messagingSenderId: "605073978449",
+  appId: "1:605073978449:web:b2c605ffff74350acdb470",
+  measurementId: "G-VWFZXJYK88"
+}
+const app = initializeApp(firebaseConfig)
+const db = getDatabase(app)
+
+// -------------------- HELPERS base64url <-> ArrayBuffer --------------------
+function bufferToBase64Url(buffer) {
+  const bytes = new Uint8Array(buffer)
+  let str = ""
+  for (let i = 0; i < bytes.byteLength; i++) str += String.fromCharCode(bytes[i])
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function base64UrlToBuffer(baseurl) {
+  baseurl = baseurl.replace(/-/g, '+').replace(/_/g, '/')
+  while (baseurl.length % 4) baseurl += '='
+  const str = atob(baseurl)
+  const bytes = new Uint8Array(str.length)
+  for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i)
+  return bytes.buffer
+}
+
+// -------------------- UI refs --------------------
+const statusEl = document.getElementById('status')
+const dumpEl = document.getElementById('dump')
+
+// util para exibir status
+function setStatus(txt) { statusEl.textContent = txt }
+
+// -------------------- FUNÇÕES PRINCIPAIS --------------------
+
+// Salva os dados de registro no Realtime DB em /admins/{username}/webauthn
+async function saveCredentialToFirebase(username, cred) {
+  // cred: { idBase64, rawIdBase64, attestationObjBase64, clientDataJSONBase64, publicKey: optional }
+  const adminRef = ref(db, `admins/${username}/webauthn`)
+  // Em demo salvamos o objecto de attestation. Em produção faça validação no servidor
+  await set(adminRef, cred)
+  dumpEl.textContent = JSON.stringify({saved:cred}, null, 2)
+}
+
+// Recupera credencial do firebase
+async function getCredentialFromFirebase(username) {
+  const snap = await get(child(ref(db), `admins/${username}/webauthn`))
+  return snap.exists() ? snap.val() : null
+}
+
+// REGISTRAR BIOMETRIA (create)
+document.getElementById('btnRegistrarBiometria').addEventListener('click', async () => {
+  try {
+    if (!window.PublicKeyCredential) {
+      setStatus('WebAuthn não disponível neste navegador')
+      return
+    }
+
+    const username = document.getElementById('usuario').value || 'admin'
+    setStatus('Iniciando registro — permita a autenticação no dispositivo')
+
+    // challenge gerado no cliente para demo; em produção gere no servidor e valide attestation
+    const challenge = window.crypto.getRandomValues(new Uint8Array(32))
+
+    // user.id precisa ser ArrayBuffer; aqui usamos username bytes para demo
+    const userId = new TextEncoder().encode(username)
+
+    const publicKey = {
+      challenge: challenge,
+      rp: { name: "Morais Piscinas" },
+      user: {
+        id: userId,
+        name: username,
+        displayName: username
+      },
+      pubKeyCredParams: [
+        { type: "public-key", alg: -7 },   // ES256
+        { type: "public-key", alg: -257 }  // RS256 opcional
+      ],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform", // força autenticador do dispositivo (FaceID/Windows Hello)
+        userVerification: "required"
+      },
+      timeout: 60000,
+      attestation: "none"
+    }
+
+    const cred = await navigator.credentials.create({ publicKey })
+
+    if (!cred) {
+      setStatus('Registro cancelado ou não finalizado')
+      return
+    }
+
+    // extraia dados para salvar (base64url)
+    const rawId = new Uint8Array(cred.rawId)
+    const idB64 = bufferToBase64Url(rawId)
+    const attestationResponse = cred.response
+    const clientDataJSON = bufferToBase64Url(attestationResponse.clientDataJSON)
+    const attestationObject = bufferToBase64Url(attestationResponse.attestationObject)
+
+    // salve no firebase (registro)
+    await saveCredentialToFirebase(username, {
+      id: idB64,
+      rawId: idB64,
+      clientDataJSON,
+      attestationObject,
+      createdAt: Date.now()
+    })
+
+    setStatus('Biometria registrada com sucesso para ' + username)
+  } catch (err) {
+    console.error(err)
+    setStatus('Erro no registro: ' + (err.message || err))
+  }
+})
+
+// LOGIN POR BIOMETRIA (get)
+document.getElementById('btnLoginBiometria').addEventListener('click', async () => {
+  try {
+    if (!window.PublicKeyCredential) {
+      setStatus('WebAuthn não disponível neste navegador')
+      return
+    }
+
+    const username = document.getElementById('usuario').value || 'admin'
+    setStatus('Recuperando credencial cadastrada')
+
+    const credFromDb = await getCredentialFromFirebase(username)
+    if (!credFromDb || !credFromDb.id) {
+      setStatus('Nenhuma credencial encontrada para ' + username)
+      return
+    }
+
+    const allowCred = {
+      id: base64UrlToBuffer(credFromDb.id),
+      type: 'public-key',
+      transports: ['internal']
+    }
+
+    // challenge — em produção servidor gera e verifica assinatura; aqui generate random for demo
+    const challenge = window.crypto.getRandomValues(new Uint8Array(32))
+
+    const publicKey = {
+      challenge: challenge,
+      timeout: 60000,
+      allowCredentials: [allowCred],
+      userVerification: 'required'
+    }
+
+    setStatus('Solicitando autenticação biométrica — permita no dispositivo')
+    const assertion = await navigator.credentials.get({ publicKey })
+
+    if (!assertion) {
+      setStatus('Autenticação cancelada ou não concluída')
+      return
+    }
+
+    // extraia dados da resposta de assertion
+    const authData = assertion.response.authenticatorData
+    const clientDataJSON = assertion.response.clientDataJSON
+    const sig = assertion.response.signature
+    const userHandle = assertion.response.userHandle
+
+    // converta para base64url para enviar/armazenar
+    const result = {
+      id: bufferToBase64Url(assertion.rawId),
+      clientDataJSON: bufferToBase64Url(clientDataJSON),
+      authenticatorData: bufferToBase64Url(authData),
+      signature: bufferToBase64Url(sig),
+      userHandle: userHandle ? bufferToBase64Url(userHandle) : null,
+      loggedAt: Date.now()
+    }
+
+    // Para demo, consideramos autenticação bem sucedida se get retorna um assertion válido
+    // Em produção envie result ao servidor para validar a assinatura com a publicKey do registrador
+    await update(ref(db, `admins/${username}/webauthn`), { lastAuth: result })
+
+    setStatus('Login biométrico concluído — usuário autenticado: ' + username)
+    dumpEl.textContent = JSON.stringify({assertion: result}, null, 2)
+
+    // aqui você pode redirecionar para dashboard
+    // window.location.href = 'dashboard.html'
+  } catch (err) {
+    console.error(err)
+    setStatus('Erro na autenticação: ' + (err.message || err))
+  }
+})
+
+// LOGIN POR SENHA (fallback simples)
+// para demo: checa /admins/{username}/password no Realtime DB
+document.getElementById('btnLoginSenha').addEventListener('click', async () => {
+  const username = document.getElementById('usuario').value || 'admin'
+  const senha = document.getElementById('senha').value || ''
+  setStatus('Verificando senha')
+
+  try {
+    const snap = await get(child(ref(db), `admins/${username}/password`))
+    if (!snap.exists()) {
+      setStatus('Nenhuma senha cadastrada para este usuário (use biometria ou registre uma senha no DB)')
+      return
+    }
+    const stored = snap.val()
+    // neste exemplo o valor stored é texto simples; em produção salve hash bcrypt no servidor
+    if (stored === senha) {
+      setStatus('Login por senha bem sucedido: ' + username)
+      // redirecione
+      // window.location.href = 'dashboard.html'
+    } else {
+      setStatus('Senha incorreta')
+    }
+  } catch (err) {
+    console.error(err)
+    setStatus('Erro ao validar senha: ' + (err.message || err))
+  }
+})
+
+</script>
+</body>
+</html>
